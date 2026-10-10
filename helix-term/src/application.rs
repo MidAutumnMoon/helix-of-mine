@@ -1,6 +1,6 @@
 use arc_swap::{access::Map, ArcSwap};
 use futures_util::Stream;
-use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Range, Selection};
+use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Position, Range, Selection};
 use helix_lsp::{
     lsp::{self, notification::Notification},
     util::lsp_range_to_range,
@@ -197,13 +197,18 @@ impl Application {
                         // opened last is focused on.
                         let view_id = editor.tree.focus;
                         let doc = doc_mut!(editor, &doc_id);
-                        let selection = pos
-                            .into_iter()
-                            .map(|coords| {
-                                Range::point(pos_at_coords(doc.text().slice(..), coords, true))
-                            })
-                            .collect();
-                        doc.set_selection(view_id, selection);
+                        // Only an explicitly requested position (`file:row:col`, `+N`) is
+                        // applied; the implicit (0, 0) default would clobber a live or
+                        // restored cursor.
+                        if pos.iter().any(|coords| *coords != Position::default()) {
+                            let selection = pos
+                                .into_iter()
+                                .map(|coords| {
+                                    Range::point(pos_at_coords(doc.text().slice(..), coords, true))
+                                })
+                                .collect();
+                            doc.set_selection(view_id, selection);
+                        }
                     }
                 }
 
@@ -1353,6 +1358,10 @@ impl Application {
             log::error!("Error executing job: {}", err);
             errs.push(err);
         };
+
+        // SIGTERM/SIGINT exits skip every view close, so their selections are
+        // still intact here.
+        self.editor.persist_cursor_positions();
 
         if let Err(err) = self.editor.flush_writes().await {
             log::error!("Error writing: {}", err);

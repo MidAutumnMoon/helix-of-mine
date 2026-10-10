@@ -414,7 +414,7 @@ fn entry_path(workspace: &Path) -> PathBuf {
     workspace_trust_dir().join(path_filename(workspace))
 }
 
-fn path_filename(workspace: &Path) -> String {
+pub(crate) fn path_filename(workspace: &Path) -> String {
     let mut hasher = Sha256::new();
     // `Path` is OsStr; encode lossy-but-deterministically. Two workspaces whose normalized paths
     // differ only in non-UTF-8 bytes will collide here, but find_workspace() returns paths derived

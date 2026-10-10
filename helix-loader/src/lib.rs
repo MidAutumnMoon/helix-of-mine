@@ -1,4 +1,5 @@
 pub mod config;
+pub mod cursor_restore;
 pub mod grammar;
 pub mod workspace_trust;
 
@@ -136,6 +137,15 @@ pub fn cache_dir() -> PathBuf {
 pub fn data_dir() -> PathBuf {
     let strategy = choose_base_strategy().expect("Unable to find the data directory!");
     let mut path = strategy.data_dir();
+    path.push("helix");
+    path
+}
+
+pub fn state_dir() -> PathBuf {
+    let strategy = choose_base_strategy().expect("Unable to find the state directory!");
+    // Only the XDG strategy has a state home; elsewhere fall back to the data dir, where
+    // the other per-machine state (workspace trust) already lives.
+    let mut path = strategy.state_dir().unwrap_or_else(|| strategy.data_dir());
     path.push("helix");
     path
 }

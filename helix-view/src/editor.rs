@@ -266,6 +266,16 @@ impl Default for FileExplorerConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct CursorRestoreConfig {
+    /// Restore the last saved cursor position when a file is opened. Defaults to false.
+    pub enable: bool,
+    /// Language names whose files never save or restore cursor positions. Extends the
+    /// built-in list, see BUILTIN_EXCLUDED_LANGUAGES. Defaults to empty.
+    pub excluded_languages: Vec<String>,
+}
+
 fn serialize_alphabet<S>(alphabet: &[char], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -368,6 +378,8 @@ pub struct Config {
     pub file_explorer: FileExplorerConfig,
     /// Configuration of the statusline elements
     pub statusline: StatusLineConfig,
+    /// Cursor position persistence across sessions.
+    pub cursor_restore: CursorRestoreConfig,
     /// Shape for cursor in each mode
     pub cursor_shape: CursorShapeConfig,
     /// Set to `true` to override automatic detection of terminal truecolor support in the event of a false negative. Defaults to `false`.
@@ -1204,6 +1216,7 @@ impl Default for Config {
             file_picker: FilePickerConfig::default(),
             file_explorer: FileExplorerConfig::default(),
             statusline: StatusLineConfig::default(),
+            cursor_restore: CursorRestoreConfig::default(),
             cursor_shape: CursorShapeConfig::default(),
             true_color: false,
             undercurl: false,
@@ -2102,6 +2115,7 @@ impl Editor {
     pub fn open(&mut self, path: &Path, action: Action) -> Result<DocumentId, DocumentOpenError> {
         let path = helix_stdx::path::canonicalize(path);
         let id = self.document_id_by_path(&path);
+        let was_fresh = id.is_none();
 
         let id = if let Some(id) = id {
             id
@@ -2141,11 +2155,17 @@ impl Editor {
         };
 
         self.switch(id, action);
+        // Only a freshly created doc restores; an existing one keeps its live cursor.
+        if was_fresh {
+            self.restore_cursor_position(&path, id);
+        }
 
         Ok(id)
     }
 
     pub fn close(&mut self, id: ViewId) {
+        // Must run before the loop below deletes the closing view's selections.
+        self.persist_view_positions(id);
         // Remove selections for the closed view on all documents.
         for doc in self.documents_mut() {
             doc.remove_view(id);
@@ -2165,6 +2185,9 @@ impl Editor {
 
         // This will also disallow any follow-up writes
         self.saves.remove(&doc_id);
+
+        // Must run before `documents.remove` below deletes the doc's selections.
+        self.persist_doc_positions(doc_id);
 
         enum Action {
             Close(ViewId),

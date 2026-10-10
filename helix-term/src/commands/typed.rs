@@ -166,11 +166,14 @@ fn open_impl(cx: &mut compositor::Context, args: Args, action: Action) -> anyhow
         } else {
             // Otherwise, just open the file
             let _ = cx.editor.open(&path, action)?;
-            let (view, doc) = current!(cx.editor);
-            let pos = Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
-            doc.set_selection(view.id, pos);
-            // does not affect opening a buffer without pos
-            align_view(doc, view, Align::Center);
+            // Only an explicitly requested position (`file:row:col`) is applied; the
+            // implicit (0, 0) default would clobber a live or restored cursor.
+            if pos != helix_core::Position::default() {
+                let (view, doc) = current!(cx.editor);
+                let pos = Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
+                doc.set_selection(view.id, pos);
+                align_view(doc, view, Align::Center);
+            }
         }
     }
     Ok(())
