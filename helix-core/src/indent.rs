@@ -457,6 +457,10 @@ pub struct Indentation<'a> {
     /// The alignment, as a string containing only tabs & spaces. Storing this as a string instead of e.g.
     /// the (visual) width ensures that the alignment is preserved even if the tab width changes.
     align: Option<RopeSlice<'a>>,
+    /// The line `align` starts on (the `@anchor`'s line), in the text the
+    /// slice borrows from. `None` where `align` has no anchor (`@opaque`
+    /// preservation).
+    align_anchor_line: Option<usize>,
 }
 
 impl<'a> Indentation<'a> {
@@ -516,8 +520,9 @@ enum IndentCaptureType<'a> {
     IndentAlways,
     Outdent,
     OutdentAlways,
-    /// Alignment given as a string of whitespace
-    Align(RopeSlice<'a>),
+    /// Alignment given as a string of whitespace, with the line it starts on
+    /// (the anchor's line)
+    Align(RopeSlice<'a>, usize),
 }
 
 /// A capture from the indent query which does not define an indent but extends
@@ -601,7 +606,10 @@ fn query_indents<'a>(
             } else if capture == query.outdent_always_capture {
                 IndentCaptureType::OutdentAlways
             } else if capture == query.align_capture {
-                IndentCaptureType::Align(RopeSlice::from(""))
+                IndentCaptureType::Align(
+                    RopeSlice::from(""),
+                    text.byte_to_line(matched_node.node.start_byte() as usize),
+                )
             } else if capture == query.anchor_capture {
                 if anchor.is_some() {
                     log::error!("Invalid indent query: Encountered more than one @anchor in the same match.")
@@ -640,7 +648,7 @@ fn query_indents<'a>(
         }
         for (node_id, mut capture) in added_indent_captures {
             // Set the anchor for all align queries.
-            if let IndentCaptureType::Align(_) = capture.capture_type {
+            if let IndentCaptureType::Align(..) = capture.capture_type {
                 let Some(anchor) = anchor else {
                     log::error!("Invalid indent query: @align requires an accompanying @anchor.");
                     continue;
@@ -649,6 +657,7 @@ fn query_indents<'a>(
                 let line_start = text.line_to_byte(line);
                 capture.capture_type = IndentCaptureType::Align(
                     text.byte_slice(line_start..anchor.start_byte() as usize),
+                    line,
                 );
             }
             indent_captures
@@ -986,6 +995,35 @@ pub fn treesitter_indent_for_pos<'a>(
     pos: usize,
     new_line: bool,
 ) -> Option<Indentation<'a>> {
+    indent_for_pos_ex(
+        query,
+        syntax,
+        loader,
+        tab_width,
+        indent_width,
+        text,
+        line,
+        pos,
+        new_line,
+    )
+    .map(|(indentation, _)| indentation)
+}
+
+/// [`treesitter_indent_for_pos`], additionally reporting whether the position
+/// lies in the interior of an `@opaque` node, in which case the returned
+/// [`Indentation`] preserves the leading whitespace.
+#[allow(clippy::too_many_arguments)]
+fn indent_for_pos_ex<'a>(
+    query: &IndentQuery,
+    syntax: &'a Syntax,
+    loader: &syntax::Loader,
+    tab_width: usize,
+    indent_width: usize,
+    text: RopeSlice<'a>,
+    line: usize,
+    pos: usize,
+    new_line: bool,
+) -> Option<(Indentation<'a>, bool)> {
     let byte_pos = text.char_to_byte(pos) as u32;
     // Inside an injection layer indent with that language's query and tree,
     // then shift the whole result by the injection's base indent.
@@ -1024,10 +1062,13 @@ pub fn treesitter_indent_for_pos<'a>(
         let first = line_slice
             .first_non_whitespace_char()
             .unwrap_or_else(|| line_slice.len_chars());
-        return Some(Indentation {
-            align: Some(line_slice.slice(..first)),
-            ..Default::default()
-        });
+        return Some((
+            Indentation {
+                align: Some(line_slice.slice(..first)),
+                ..Default::default()
+            },
+            true,
+        ));
     }
     // The injected walk above is relative to the injection's own tree root (the
     // embedded code starts at level 0). Shift it by the indent of the injection's
@@ -1035,7 +1076,7 @@ pub fn treesitter_indent_for_pos<'a>(
     if injected.is_some() {
         result.indent += injection_base_level(syntax, text, byte_pos, tab_width, indent_width);
     }
-    Some(result)
+    Some((result, false))
 }
 
 /// Compute indentation by *scope containment*.
@@ -1089,6 +1130,7 @@ fn containment_accounting<'a>(
     let mut outdent: usize = 0;
     let mut outdent_always: usize = 0;
     let mut align: Option<RopeSlice<'a>> = None;
+    let mut align_anchor_line: Option<usize> = None;
     // Same-line collapse: a scope contributes at most one level per physical line
     // it opens on.
     let mut counted_start_lines: Vec<usize> = Vec::new();
@@ -1102,7 +1144,7 @@ fn containment_accounting<'a>(
             let mut has_outdent = false;
             let mut has_outdent_always = false;
             let mut header_scoped = false;
-            let mut node_align: Option<RopeSlice<'a>> = None;
+            let mut node_align: Option<(RopeSlice<'a>, usize)> = None;
             for def in defs {
                 match def.capture_type {
                     IndentCaptureType::Indent => {
@@ -1115,7 +1157,7 @@ fn containment_accounting<'a>(
                     }
                     IndentCaptureType::Outdent => has_outdent = true,
                     IndentCaptureType::OutdentAlways => has_outdent_always = true,
-                    IndentCaptureType::Align(a) => node_align = Some(a),
+                    IndentCaptureType::Align(a, anchor_line) => node_align = Some((a, anchor_line)),
                 }
             }
 
@@ -1160,9 +1202,10 @@ fn containment_accounting<'a>(
                 }
             }
             // Innermost containing alignment wins (first seen on the upward walk).
-            if let Some(a) = node_align {
+            if let Some((a, anchor_line)) = node_align {
                 if contains && align.is_none() {
                     align = Some(a);
+                    align_anchor_line = Some(anchor_line);
                 }
             }
         }
@@ -1186,6 +1229,7 @@ fn containment_accounting<'a>(
             outdent,
             outdent_always,
             align,
+            align_anchor_line,
         },
         false,
     ))
@@ -1269,6 +1313,176 @@ pub fn is_outdent_token_at(
             _ => return false,
         }
     }
+}
+
+/// Whether `desired` differs from the leading whitespace run (`ws_len` chars)
+/// of `line`.
+fn differs_from_leading_ws(desired: &str, line: RopeSlice, ws_len: usize) -> bool {
+    desired.chars().ne(line.chars().take(ws_len))
+}
+
+/// Compute the changes which reindent `lines` to the indentation computed
+/// by the tree-sitter indent queries. Blank lines are stripped to empty
+/// unless their whitespace is literal content inside an `@opaque` node, and
+/// lines whose indentation cannot be computed are left untouched.
+/// Returns `None` if no line's language has an indent query. `lines` must
+/// be sorted and deduplicated.
+pub fn reindent(
+    loader: &syntax::Loader,
+    syntax: &Syntax,
+    indent_style: &IndentStyle,
+    tab_width: usize,
+    text: RopeSlice<'_>,
+    lines: &[usize],
+) -> Option<Vec<(usize, usize, Option<Tendril>)>> {
+    let indent_width = indent_style.indent_width(tab_width);
+
+    struct ReindentLine<'a> {
+        line: usize,
+        /// Char length of the leading whitespace run.
+        ws_len: usize,
+        /// The indentation the line should receive; `None` leaves it untouched.
+        desired: Option<String>,
+        /// Kept for the align fixup below.
+        indentation: Option<Indentation<'a>>,
+    }
+
+    // Changes are only collected, never applied here: the align fixup below
+    // assumes every line was computed against the original text.
+    let mut computed: Vec<ReindentLine> = Vec::with_capacity(lines.len());
+    let mut any_query = false;
+
+    for &line in lines {
+        let line_slice = text.line(line);
+        let ws_len = line_slice
+            .chars()
+            .take_while(|ch| matches!(ch, ' ' | '\t'))
+            .count();
+        // Blank: only the whitespace run and a line ending. '\r' is matched
+        // separately since `char_is_line_ending` covers it only with the
+        // unicode-lines feature.
+        let blank = line_slice
+            .chars()
+            .skip(ws_len)
+            .all(|ch| char_is_line_ending(ch) || ch == '\r');
+        let pos = if blank {
+            text.line_to_char(line)
+        } else {
+            text.line_to_char(line) + ws_len
+        };
+        let byte = text.char_to_byte(pos) as u32;
+        // The query is resolved per line so injections (a rust fence inside
+        // markdown) reindent with their own language while lines whose
+        // language has no indent query are skipped.
+        let layer = syntax.layer_for_byte_range(byte, byte);
+        let Some(query) = loader.indent_query(syntax.layer(layer).language) else {
+            continue;
+        };
+        any_query = true;
+
+        if blank {
+            // @opaque interiors keep their whitespace: it is literal content.
+            let Some((_, opaque)) = indent_for_pos_ex(
+                query,
+                syntax,
+                loader,
+                tab_width,
+                indent_width,
+                text,
+                line,
+                pos,
+                false,
+            ) else {
+                continue;
+            };
+            computed.push(ReindentLine {
+                line,
+                ws_len,
+                desired: (!opaque).then(String::new),
+                indentation: None,
+            });
+            continue;
+        }
+
+        let Some((indentation, _)) = indent_for_pos_ex(
+            query,
+            syntax,
+            loader,
+            tab_width,
+            indent_width,
+            text,
+            line,
+            pos,
+            false,
+        ) else {
+            continue;
+        };
+        computed.push(ReindentLine {
+            line,
+            ws_len,
+            desired: Some(indentation.to_string(indent_style, tab_width)),
+            indentation: Some(indentation),
+        });
+    }
+
+    if !any_query {
+        return None;
+    }
+
+    // An @align continuation bakes its prefix from the anchor line's original
+    // leading whitespace. When this pass also reindents the anchor line,
+    // rebuild the prefix from its new indentation so the aligned block shifts
+    // with it. Anchors precede their continuations (queries anchor to earlier
+    // tokens), so one ascending pass also fixes cascaded alignment.
+    for i in 0..computed.len() {
+        let Some(ind) = &computed[i].indentation else {
+            continue;
+        };
+        let (Some(align), Some(anchor_line)) = (ind.align, ind.align_anchor_line) else {
+            continue;
+        };
+        let net_indent = ind.net_indent();
+        let Some((anchor_desired, anchor_ws_len)) = computed
+            .binary_search_by_key(&anchor_line, |entry| entry.line)
+            .ok()
+            .and_then(|idx| {
+                let entry = &computed[idx];
+                entry.desired.clone().map(|d| (d, entry.ws_len))
+            })
+        else {
+            continue;
+        };
+        // An unchanged anchor keeps the baked prefix.
+        if !differs_from_leading_ws(&anchor_desired, text.line(anchor_line), anchor_ws_len) {
+            continue;
+        }
+        // The align slice begins at the anchor line's start, so dropping the
+        // anchor line's leading-whitespace run leaves everything after it.
+        let mut base = anchor_desired;
+        base.push_str(
+            &align
+                .slice(anchor_ws_len.min(align.len_chars())..)
+                .to_string(),
+        );
+        computed[i].desired = Some(add_indent_level(
+            whitespace_with_same_width(RopeSlice::from(base.as_str())),
+            net_indent,
+            indent_style,
+            tab_width,
+        ));
+    }
+
+    let mut changes = Vec::new();
+    for entry in &computed {
+        let Some(desired) = entry.desired.as_deref() else {
+            continue;
+        };
+        if differs_from_leading_ws(desired, text.line(entry.line), entry.ws_len) {
+            let start = text.line_to_char(entry.line);
+            changes.push((start, start + entry.ws_len, Some(Tendril::from(desired))));
+        }
+    }
+    Some(changes)
 }
 
 /// Returns the indentation for a new line.
@@ -1389,8 +1603,10 @@ pub fn get_scopes<'a>(syntax: Option<&'a Syntax>, text: RopeSlice, pos: usize) -
 
 #[cfg(test)]
 mod test {
+    use std::sync::LazyLock;
+
     use super::*;
-    use crate::Rope;
+    use crate::{syntax::Loader, Rope, Transaction};
 
     #[test]
     fn test_indent_level() {
@@ -1498,5 +1714,101 @@ mod test {
             ),
             None
         );
+    }
+
+    static LOADER: LazyLock<Loader> = LazyLock::new(crate::config::default_lang_loader);
+
+    fn reindent_all(source: &str, language: &str) -> Option<Vec<(usize, usize, Option<Tendril>)>> {
+        let loader = &*LOADER;
+        let language = loader.language_for_name(language).unwrap();
+        let doc = Rope::from(source);
+        let syntax = Syntax::new(doc.slice(..), language, loader).unwrap();
+        let lines: Vec<usize> = (0..doc.len_lines()).collect();
+        reindent(
+            loader,
+            &syntax,
+            &IndentStyle::Spaces(4),
+            4,
+            doc.slice(..),
+            &lines,
+        )
+    }
+
+    fn reindent_to_string(source: &str, language: &str) -> String {
+        let mut doc = Rope::from(source);
+        let changes = reindent_all(source, language).unwrap();
+        Transaction::change(&doc, changes.into_iter()).apply(&mut doc);
+        doc.to_string()
+    }
+
+    #[test]
+    fn reindent_restores_canonical_indent() {
+        assert_eq!(
+            reindent_to_string(
+                "fn main() {\n        let a = 1;\n   let b = 2;\n}\n",
+                "rust",
+            ),
+            "fn main() {\n    let a = 1;\n    let b = 2;\n}\n",
+        );
+    }
+
+    #[test]
+    fn reindent_is_idempotent() {
+        // Includes a strippable blank line, a tab-indented line and a
+        // mis-indented closing brace.
+        let once = reindent_to_string(
+            "fn main() {\n        let a = 1;\n   \n\tlet b = 2;\n  }\n",
+            "rust",
+        );
+        assert_eq!(once, "fn main() {\n    let a = 1;\n\n    let b = 2;\n}\n");
+        assert!(reindent_all(&once, "rust").unwrap().is_empty());
+    }
+
+    #[test]
+    fn reindent_blank_and_opaque_lines() {
+        // The blank line outside the raw string is stripped; inside it the
+        // whitespace is string content.
+        let source = "fn main() {\n    let a = 1;\n   \n    let s = r#\"\n  \ncontent\n\"#;\n}\n";
+        let expected = "fn main() {\n    let a = 1;\n\n    let s = r#\"\n  \ncontent\n\"#;\n}\n";
+        assert_eq!(reindent_to_string(source, "rust"), expected);
+    }
+
+    #[test]
+    fn reindent_crlf_blank_lines() {
+        // A whitespace-only CRLF line counts as blank ('\r' is not a line
+        // ending without the unicode-lines feature) and is stripped.
+        assert_eq!(
+            reindent_to_string(
+                "fn main() {\r\n    let a = 1;\r\n   \r\n\tlet b = 2;\r\n  }\r\n",
+                "rust",
+            ),
+            "fn main() {\r\n    let a = 1;\r\n\r\n    let b = 2;\r\n}\r\n",
+        );
+    }
+
+    #[test]
+    fn reindent_moves_align_with_its_anchor() {
+        // The continuation is @align-ed to the anchor `a` on the `def` line,
+        // which this pass also dedents: the continuation must follow it.
+        assert_eq!(
+            reindent_to_string("  def foo(a,\n   b):\n        pass\n", "python"),
+            "def foo(a,\n        b):\n    pass\n",
+        );
+    }
+
+    #[test]
+    fn reindent_markdown_injected_code() {
+        assert_eq!(
+            reindent_to_string(
+                "prose\n\n```rust\nfn main() {\n        let a = 1;\n    }\n```\nmore prose\n",
+                "markdown",
+            ),
+            "prose\n\n```rust\nfn main() {\n    let a = 1;\n}\n```\nmore prose\n",
+        );
+    }
+
+    #[test]
+    fn reindent_without_indent_query() {
+        assert!(reindent_all("Some prose.\n\nMore prose.\n", "markdown").is_none());
     }
 }

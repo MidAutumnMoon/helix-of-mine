@@ -5241,81 +5241,105 @@ fn format_selections(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
     let view_id = view.id;
 
-    // via lsp if available
-    // TODO: else via tree-sitter indentation calculations
-
-    if doc.selection(view_id).len() != 1 {
-        cx.editor
-            .set_error("format_selections only supports a single selection for now");
-        return;
-    }
-
-    // TODO extra LanguageServerFeature::FormatSelections?
-    // maybe such that LanguageServerFeature::Format contains it as well
-    let Some(language_server) = doc
+    let language_server = doc
         .language_servers_with_feature(LanguageServerFeature::Format)
         .find(|ls| {
             matches!(
                 ls.capabilities().document_range_formatting_provider,
                 Some(lsp::OneOf::Left(true) | lsp::OneOf::Right(_))
             )
-        })
-    else {
-        cx.editor
-            .set_error("No configured language server supports range formatting");
-        return;
-    };
+        });
 
-    let offset_encoding = language_server.offset_encoding();
-    let ranges: Vec<lsp::Range> = doc
-        .selection(view_id)
-        .iter()
-        .map(|range| range_to_lsp_range(doc.text(), *range, offset_encoding))
-        .collect();
-
-    // TODO: handle fails
-    // TODO: concurrent map over all ranges
-
-    let range = ranges[0];
-
-    let future = language_server
-        .text_document_range_formatting(
-            doc.identifier(),
-            range,
-            lsp::FormattingOptions {
-                tab_size: doc.tab_width() as u32,
-                insert_spaces: matches!(doc.indent_style, IndentStyle::Spaces(_)),
-                ..Default::default()
-            },
-            None,
-        )
-        .unwrap();
-
-    let text = doc.text().clone();
-    let doc_id = doc.id();
-    let doc_version = doc.version();
-
-    tokio::spawn(async move {
-        match future.await {
-            Ok(Some(res)) => {
-                let transaction =
-                    helix_lsp::util::generate_transaction_from_edits(&text, res, offset_encoding);
-                job::dispatch(move |editor, _compositor| {
-                    let Some(doc) = editor.document_mut(doc_id) else {
-                        return;
-                    };
-                    // Updating a desynced document causes problems with applying the transaction
-                    if doc.version() != doc_version {
-                        return;
-                    }
-                    doc.apply(&transaction, view_id);
-                })
-                .await
-            }
-            Err(err) => log::error!("format sections failed: {err}"),
-            Ok(None) => (),
+    if let Some(language_server) = language_server {
+        if doc.selection(view_id).len() != 1 {
+            cx.editor
+                .set_error("format_selections only supports a single selection for now");
+            return;
         }
-    });
+
+        // TODO extra LanguageServerFeature::FormatSelections?
+        // maybe such that LanguageServerFeature::Format contains it as well
+
+        let offset_encoding = language_server.offset_encoding();
+        let ranges: Vec<lsp::Range> = doc
+            .selection(view_id)
+            .iter()
+            .map(|range| range_to_lsp_range(doc.text(), *range, offset_encoding))
+            .collect();
+
+        // TODO: handle fails
+        // TODO: concurrent map over all ranges
+
+        let range = ranges[0];
+
+        let future = language_server
+            .text_document_range_formatting(
+                doc.identifier(),
+                range,
+                lsp::FormattingOptions {
+                    tab_size: doc.tab_width() as u32,
+                    insert_spaces: matches!(doc.indent_style, IndentStyle::Spaces(_)),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+
+        let text = doc.text().clone();
+        let doc_id = doc.id();
+        let doc_version = doc.version();
+
+        tokio::spawn(async move {
+            match future.await {
+                Ok(Some(res)) => {
+                    let transaction = helix_lsp::util::generate_transaction_from_edits(
+                        &text,
+                        res,
+                        offset_encoding,
+                    );
+                    job::dispatch(move |editor, _compositor| {
+                        let Some(doc) = editor.document_mut(doc_id) else {
+                            return;
+                        };
+                        // Updating a desynced document causes problems with applying the transaction
+                        if doc.version() != doc_version {
+                            return;
+                        }
+                        doc.apply(&transaction, view_id);
+                    })
+                    .await
+                }
+                Err(err) => log::error!("format sections failed: {err}"),
+                Ok(None) => (),
+            }
+        });
+        return;
+    } else if let Some(syntax) = doc.syntax() {
+        let lines = get_lines(doc, view_id);
+        let changes = {
+            let loader = cx.editor.syn_loader.load();
+            indent::reindent(
+                &loader,
+                syntax,
+                &doc.indent_style,
+                doc.tab_width(),
+                doc.text().slice(..),
+                &lines,
+            )
+        };
+        if let Some(changes) = changes {
+            if !changes.is_empty() {
+                let transaction = Transaction::change(doc.text(), changes.into_iter());
+                doc.apply(&transaction, view.id);
+            }
+            exit_select_mode(cx);
+            return;
+        }
+    }
+
+    cx.editor.set_error(
+        "No configured language server supports range formatting and no tree-sitter indent query is available",
+    );
 }
 
 fn join_selections_impl(cx: &mut Context, select_space: bool) {
