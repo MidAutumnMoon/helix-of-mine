@@ -4,6 +4,17 @@
 
 Source code of helix editor soft fork with custom patches.
 
+Our patches in order:
+- xtpsxlks: setup AGENTS.md (begin of our commits)
+- sqxqynou: restore cursor position from the last session
+- mzllpmkp: tree-sitter reindent fallback for =
+- lontxknu: nix: scope indented strings and outdent the closing ''
+- mplpzozv: nix: pin grammar sources with hashed fetches for offline eval
+- wxnrpplv: nix: compile all grammars in one derivation
+- lnowqpmx: record unique fork commits in AGENTS.md (end of our commits)
+
+New commits go between the begin commit (`xtpsxlks`) and the record commit (the last entry above).
+
 ## jj workflow
 
 Own patches are described commits, always rebased on top of `master@upstream` (github.com/helix-editor/helix). Upstream history is immutable. The patch stack is ours to rewrite. Backups go to `origin` (this repo's GitHub fork), never to upstream.
@@ -20,15 +31,34 @@ jj config set --repo git.push 'origin'
 jj config set --repo revsets.log 'trunk()::@'
 jj config set --repo 'remotes.upstream.fetch-bookmarks' 'master'  # only master and release tags import
 jj git fetch  # brings in master@upstream; the trunk() warning here is expected
-jj bookmark track master@upstream
+jj bookmark track master@origin    # not @upstream: master is the fork tip
 ```
 
 Repo config lives under `~/.config/jj/repos/`, not in `.jj/`. `jj config edit --repo` opens it.
+
+### Preflight
+
+Run before touching the stack:
+
+```
+jj config list --repo | grep trunk    # must say master@upstream
+```
+
+In `jj log`, every commit from `xtpsxlks` up must show `○`. A `◆` inside our
+stack means the stack is immutable: `jj new`/`jj rebase` silently fork
+instead of rebasing. Fix trunk() first (see Setup).
 
 ### Sync with upstream
 
 ```
 jj git fetch && jj rebase -d master@upstream --skip-emptied
+```
+
+If the rebase moved `languages.toml` grammar revs, regenerate the content pins and fold the delta into the pin patch (`mplpzozv`):
+
+```
+./contrib/update-grammar-sources.sh   # incremental: prefetches only changed revs
+jj absorb
 ```
 
 Bare `jj rebase -d <dest>` from the stack tip defaults to `-b @`, which moves exactly the patch stack onto the new tip. `--skip-emptied` drops a patch that upstream implemented for us. Rebase never stops for conflicts. They are stored inside the rebased patch commits, so resolve on our own schedule:
@@ -46,8 +76,20 @@ jj squash                    # fold the resolution into the patch
 jj describe -m "short what and why"   # @ becomes the patch
 # edit, build
 jj new                                # next patch; @ stays empty on top
-jj bookmark set mine -r @-            # once: pushable fork tip
-jj git push                           # backup push to the fork
+jj bookmark set master -r @-         # fork tip; re-point after stack rewrites
+jj git push                           # publish the fork branch
+```
+
+Insert a patch into the middle of the stack:
+
+```
+jj new <parent-patch>          # stack above rebases onto the new change
+# edit, build, test
+jj describe -m "short what and why"
+jj log -r 'xtpsxlks::@'        # must be linear: check ancestry, not the graph art
+jj edit <record-commit>        # AGENTS.md: add the patch line, update the end
+                               # entry to this commit's change-id (jj log -r @)
+jj new                         # empty @ back on top
 ```
 
 Reshaping is safe. Change-ids survive every rewrite:
@@ -61,9 +103,10 @@ jj split -r <patch>       # carve one patch into two
 ### Sharp edges
 
 - `trunk()` must stay `master@upstream`. Upstream-history immutability keys off it, so never point it at the fork.
-- Never move `master` by hand. It tracks `master@upstream` and `master@origin`.
+- `master` is the fork tip, tracked at `master@origin`. After a stack rewrite, re-point it with `jj bookmark set master -r @-` before pushing. Never track `master@upstream`: fetch would drag `master` off the fork tip onto upstream.
 - Mutate through jj only. `git rebase` and `git commit` strip change-ids and break `evolog`. The one git-side op that's fine: deleting stale `refs/remotes/upstream/*` (jj has no command for it, remote bookmark positions follow git refs).
 - No rerere in jj. A patch that conflicts once re-conflicts on every sync touching that hunk. Keep patches small, and reuse a prior resolution with `jj evolog` + `jj restore --from <old> <path>`.
+- `jj new`/`jj edit`/`jj restore` rewrite the working copy to that commit's content. Nothing is lost, but re-check the tree before build or test.
 - Any jj mistake is undoable: `jj op log`, then `jj undo`.
 
 ## Make changes
