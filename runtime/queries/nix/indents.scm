@@ -53,3 +53,10 @@
 ; Indented strings are literal text (often embedded scripts); preserve their
 ; interior verbatim rather than reflowing it as code.
 (indented_string_expression) @opaque
+; The string is also a delimited scope: the closing '' dedents its own line
+; like `}`, so Enter at the delimiters (the auto-pair state `x = ''|''`)
+; puts the new line one level under the attribute and the closing '' back at
+; the attribute's level. Lines already inside a multiline string stay with
+; @opaque.
+(indented_string_expression) @indent
+(indented_string_expression "''" @outdent .)

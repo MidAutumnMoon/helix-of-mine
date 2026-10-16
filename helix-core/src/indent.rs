@@ -1811,4 +1811,50 @@ mod test {
     fn reindent_without_indent_query() {
         assert!(reindent_all("Some prose.\n\nMore prose.\n", "markdown").is_none());
     }
+
+    fn enter_indent_at(source: &str, language: &str, cursor: usize) -> String {
+        let loader = &*LOADER;
+        let language = loader.language_for_name(language).unwrap();
+        let query = loader.indent_query(language).unwrap();
+        let doc = Rope::from(source);
+        let syntax = Syntax::new(doc.slice(..), language, loader).unwrap();
+        let line = doc.slice(..).char_to_line(cursor);
+        treesitter_indent_for_pos(
+            query,
+            &syntax,
+            loader,
+            4,
+            IndentStyle::Spaces(4).indent_width(4),
+            doc.slice(..),
+            line,
+            cursor,
+            true,
+        )
+        .unwrap()
+        .to_string(&IndentStyle::Spaces(4), 4)
+    }
+
+    #[test]
+    fn nix_enter_inside_indented_string() {
+        // Enter in the auto-pair state `x = ''|''` inserts the new line at
+        // this indent + 1 and the closing `''` line at this indent
+        // (insert_newline's on_auto_pair branch), so the base must be the
+        // attribute's own level.
+        assert_eq!(
+            enter_indent_at("attr = '''';\n", "nix", 9),
+            "",
+            "top level: closing '' at column 0"
+        );
+        assert_eq!(
+            enter_indent_at("{\n    attr = '''';\n}\n", "nix", 15),
+            "    ",
+            "nested: closing '' at the attribute's level"
+        );
+        // Enter right after the opening '' of an already-multiline string.
+        assert_eq!(
+            enter_indent_at("{\n    attr = ''\n        content\n    '';\n}\n", "nix", 15),
+            "        ",
+            "first content line one level under the attribute"
+        );
+    }
 }
