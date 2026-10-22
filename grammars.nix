@@ -1,7 +1,6 @@
 {
   stdenv,
   lib,
-  runCommand,
   fetchurl,
   includeGrammarIf ? _: true,
   grammarOverlays ? [],
@@ -38,85 +37,103 @@
     else true;
   grammarsToUse = builtins.filter useGrammar languagesConfig.grammar;
   gitGrammars = builtins.filter isGitGrammar grammarsToUse;
-  buildGrammar = grammar: let
-    pin = pinFor grammar;
-  in
-    stdenv.mkDerivation {
-      # see https://github.com/NixOS/nixpkgs/blob/fbdd1a7c0bc29af5325e0d7dd70e804a972eb465/pkgs/development/tools/parsing/tree-sitter/grammar.nix
-
-      pname = "helix-tree-sitter-${grammar.name}";
-      version = grammar.source.rev;
-
-      src = fetchurl {
-        inherit (pin) url hash;
-      };
-      # The archive tarball unpacks to a single directory that unpackPhase
-      # enters; grammars nested in a monorepo then descend into their subpath.
-      preBuild =
-        lib.optionalString (builtins.hasAttr "subpath" grammar.source)
-        ''cd ${grammar.source.subpath}'';
-
-      dontConfigure = true;
-
-      FLAGS = [
-        "-Isrc"
-        "-g"
-        "-O3"
-        "-fPIC"
-        "-fno-exceptions"
-        "-Wl,-z,relro,-z,now"
-      ];
-
-      SHARED_LIB = grammar.name + stdenv.hostPlatform.extensions.sharedLibrary;
-
-      buildPhase = ''
-        runHook preBuild
-
-        if [[ -e src/scanner.cc ]]; then
-          $CXX -c src/scanner.cc -o scanner.o $FLAGS
-        elif [[ -e src/scanner.c ]]; then
-          $CC -c src/scanner.c -o scanner.o $FLAGS
-        fi
-
-        $CC -c src/parser.c -o parser.o $FLAGS
-        $CXX -shared -o $SHARED_LIB *.o
-
-        runHook postBuild
-      '';
-
-      installPhase = ''
-        runHook preInstall
-        mkdir $out
-        mv $SHARED_LIB $out/
-        runHook postInstall
-      '';
-
-      # Strip failed on darwin: strip: error: symbols referenced by indirect symbol table entries that can't be stripped
-      fixupPhase = lib.optionalString stdenv.hostPlatform.isLinux ''
-        runHook preFixup
-        $STRIP $out/$SHARED_LIB
-        runHook postFixup
-      '';
-    };
   grammarsToBuild = builtins.filter includeGrammarIf gitGrammars;
-  builtGrammars =
-    builtins.map (grammar: {
-      inherit (grammar) name;
-      value = buildGrammar grammar;
-    })
-    grammarsToBuild;
-  extensibleGrammars =
-    lib.makeExtensible (self: builtins.listToAttrs builtGrammars);
-  overlaidGrammars =
-    lib.pipe extensibleGrammars
-    (builtins.map (overlay: grammar: grammar.extend overlay) grammarOverlays);
-  sharedLibExtension = stdenv.hostPlatform.extensions.sharedLibrary;
-  grammarLinks =
-    lib.mapAttrsToList
-    (name: artifact: "ln -s ${artifact}/${name}${sharedLibExtension} $out/${name}${sharedLibExtension}")
-    (lib.filterAttrs (n: v: lib.isDerivation v) overlaidGrammars);
+
+  # A grammar spec is the build recipe input: where the unpacked source tree
+  # lives (a fetchurl FOD, referenced lazily so stale pins of excluded
+  # grammars never throw) and where in it the parser sits. Overlays extend
+  # and replace specs, not derivations; a value without a `source` attr
+  # (null) drops the grammar from the build.
+  specFor = grammar: {
+    source = fetchurl {
+      inherit (pinFor grammar) url hash;
+    };
+    subpath = grammar.source.subpath or "";
+  };
+  extensibleSpecs =
+    lib.makeExtensible (self:
+      builtins.listToAttrs
+      (builtins.map (grammar: {
+        inherit (grammar) name;
+        value = specFor grammar;
+      })
+      grammarsToBuild));
+  overlaidSpecs =
+    lib.pipe extensibleSpecs
+    (builtins.map (overlay: specs: specs.extend overlay) grammarOverlays);
+  specLines =
+    builtins.map
+    (name: let spec = overlaidSpecs.${name}; in
+      "${name}\t${spec.source}\t${spec.subpath}")
+    (builtins.attrNames (lib.filterAttrs (_: spec: spec ? source) overlaidSpecs));
 in
-  runCommand "consolidated-helix-grammars" {} ''
-    mkdir -p $out
-    ${builtins.concatStringsSep "\n" grammarLinks}
-  ''
+  # One derivation compiles every grammar, so the helix runtime closure
+  # carries a single grammar path; the per-grammar source tarballs are
+  # build-time inputs here and never enter the closure.
+  # see https://github.com/NixOS/nixpkgs/blob/fbdd1a7c0bc29af5325e0d7dd70e804a972eb465/pkgs/development/tools/parsing/tree-sitter/grammar.nix
+  stdenv.mkDerivation {
+    pname = "helix-tree-sitter-grammars";
+    version = "0";
+
+    passAsFile = ["grammarSpecs"];
+    grammarSpecs = builtins.concatStringsSep "\n" specLines;
+
+    dontUnpack = true;
+    dontConfigure = true;
+
+    FLAGS = [
+      "-Isrc"
+      "-g"
+      "-O3"
+      "-fPIC"
+      "-fno-exceptions"
+      "-Wl,-z,relro,-z,now"
+    ];
+
+    buildPhase = ''
+      runHook preBuild
+
+      mkdir -p "$out"
+      build_one() {
+          local name=$1 src=$2 subpath=$3
+          local work
+          work=$(mktemp -d)
+          tar -xf "$src" -C "$work"
+          cd "$work"/*/
+          if [[ -n "$subpath" ]]; then
+              cd "$subpath"
+          fi
+          if [[ -e src/scanner.cc ]]; then
+              $CXX -c src/scanner.cc -o scanner.o $FLAGS
+          elif [[ -e src/scanner.c ]]; then
+              $CC -c src/scanner.c -o scanner.o $FLAGS
+          fi
+          $CC -c src/parser.c -o parser.o $FLAGS
+          $CXX -shared -o "$out/$name${stdenv.hostPlatform.extensions.sharedLibrary}" *.o
+          rm -rf "$work"
+      }
+      build_line() {
+          local name src subpath
+          IFS=$'\t' read -r name src subpath <<< "$1"
+          build_one "$name" "$src" "$subpath"
+      }
+      export -f build_one build_line
+      # -r: an empty spec set (devShell builds no grammars) must not run the
+      # child once with no arguments; -e: a failed step in the per-grammar
+      # child must fail its build instead of silently shipping a degraded
+      # grammar.
+      xargs -P "$(nproc)" -r -d '\n' -n1 bash -ec 'build_line "$1"' bash < "$grammarSpecsPath"
+
+      runHook postBuild
+    '';
+
+    # Strip failed on darwin: strip: error: symbols referenced by indirect symbol table entries that can't be stripped
+    fixupPhase = lib.optionalString stdenv.hostPlatform.isLinux ''
+      runHook preFixup
+      shopt -s nullglob
+      for so in "$out"/*.so; do
+          $STRIP "$so"
+      done
+      runHook postFixup
+    '';
+  }
