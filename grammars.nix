@@ -2,23 +2,31 @@
   stdenv,
   lib,
   runCommand,
+  fetchurl,
   includeGrammarIf ? _: true,
   grammarOverlays ? [],
   ...
 }: let
   languagesConfig =
     builtins.fromTOML (builtins.readFile ./languages.toml);
+  grammarPins =
+    builtins.fromJSON (builtins.readFile ./grammar-sources.json);
   isGitGrammar = grammar:
     builtins.hasAttr "source" grammar
     && builtins.hasAttr "git" grammar.source
     && builtins.hasAttr "rev" grammar.source;
-  isGitHubGrammar = grammar: lib.hasPrefix "https://github.com" grammar.source.git;
-  toGitHubFetcher = url: let
-    match = builtins.match "https://github\\.com/([^/]*)/([^/]*)/?" url;
-  in {
-    owner = builtins.elemAt match 0;
-    repo = builtins.elemAt match 1;
-  };
+  # Throw rather than fetch at eval time: an unpinned or stale grammar must
+  # fail loudly instead of blocking evaluation on the network.
+  pinFor = grammar:
+    if grammarPins ? ${grammar.name}
+    && grammarPins.${grammar.name}.rev == grammar.source.rev
+    && grammarPins.${grammar.name}.git == grammar.source.git
+    then grammarPins.${grammar.name}
+    else throw ''
+      helix: grammar '${grammar.name}' (${grammar.source.git}) has no pin at
+      rev ${grammar.source.rev} in grammar-sources.json.
+      Run contrib/update-grammar-sources.sh to regenerate the pins.
+    '';
   # If `use-grammars.only` is set, use only those grammars.
   # If `use-grammars.except` is set, use all other grammars.
   # Otherwise use all grammars.
@@ -31,24 +39,7 @@
   grammarsToUse = builtins.filter useGrammar languagesConfig.grammar;
   gitGrammars = builtins.filter isGitGrammar grammarsToUse;
   buildGrammar = grammar: let
-    gh = toGitHubFetcher grammar.source.git;
-    sourceGit = builtins.fetchTree {
-      type = "git";
-      url = grammar.source.git;
-      rev = grammar.source.rev;
-      ref = grammar.source.ref or "HEAD";
-      shallow = true;
-    };
-    sourceGitHub = builtins.fetchTree {
-      type = "github";
-      owner = gh.owner;
-      repo = gh.repo;
-      inherit (grammar.source) rev;
-    };
-    source =
-      if isGitHubGrammar grammar
-      then sourceGitHub
-      else sourceGit;
+    pin = pinFor grammar;
   in
     stdenv.mkDerivation {
       # see https://github.com/NixOS/nixpkgs/blob/fbdd1a7c0bc29af5325e0d7dd70e804a972eb465/pkgs/development/tools/parsing/tree-sitter/grammar.nix
@@ -56,11 +47,14 @@
       pname = "helix-tree-sitter-${grammar.name}";
       version = grammar.source.rev;
 
-      src = source;
-      sourceRoot =
-        if builtins.hasAttr "subpath" grammar.source
-        then "source/${grammar.source.subpath}"
-        else "source";
+      src = fetchurl {
+        inherit (pin) url hash;
+      };
+      # The archive tarball unpacks to a single directory that unpackPhase
+      # enters; grammars nested in a monorepo then descend into their subpath.
+      preBuild =
+        lib.optionalString (builtins.hasAttr "subpath" grammar.source)
+        ''cd ${grammar.source.subpath}'';
 
       dontConfigure = true;
 

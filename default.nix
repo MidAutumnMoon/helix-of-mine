@@ -19,6 +19,7 @@
     ./docs
     ./runtime
     ./flake.lock
+    ./grammar-sources.json
     (fs.fileFilter (file: lib.strings.hasInfix ".git" file.name) ./.)
     (fs.fileFilter (file: file.hasExt "svg") ./.)
     (fs.fileFilter (file: file.hasExt "md") ./.)
